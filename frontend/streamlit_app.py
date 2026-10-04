@@ -1,15 +1,28 @@
 """
-Debug Pipeline — Streamlit Frontend
+Debug Pipeline — Streamlit Dashboard
 
 Run:  streamlit run frontend/streamlit_app.py
 API:  uvicorn app.main:app --port 8088
+
+Talks to the FastAPI backend over HTTP only — no app/ imports — so the
+dashboard and the API can run on different machines (set DEBUG_PIPELINE_API).
 """
-import time
+from __future__ import annotations
+
+import html
 import json
+import os
+import subprocess
+import sys
+from collections import Counter
+from pathlib import Path
+
 import requests
 import streamlit as st
 
-API = "http://localhost:8088/api/v1"
+API_ROOT = os.environ.get("DEBUG_PIPELINE_API", "http://127.0.0.1:8088").rstrip("/")
+API = f"{API_ROOT}/api/v1"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 st.set_page_config(
     page_title="Debug Pipeline",
@@ -18,695 +31,590 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.title("🔍 Debug Pipeline")
-    st.caption("Automated backend error detection & analysis")
-    st.divider()
+# ── Severity → status colour (icon + label always accompany the colour) ───────
+SEVERITY = {
+    "critical": {"color": "#d03b3b", "icon": "⛔", "rank": 0},
+    "high":     {"color": "#ec835a", "icon": "🔺", "rank": 1},
+    "medium":   {"color": "#fab219", "icon": "⚠️", "rank": 2},
+    "low":      {"color": "#0ca30c", "icon": "✅", "rank": 3},
+}
 
-    # Live health status
+st.markdown(
+    """
+<style>
+:root {
+  --dp-border: rgba(128,128,128,.22);
+  --dp-muted: rgba(128,128,128,.95);
+  --dp-soft: rgba(128,128,128,.08);
+}
+.block-container { padding-top: 3.5rem; max-width: 1280px; }
+.dp-hero h1 { font-size: 1.9rem; margin: 0 0 .15rem 0; padding: 0; }
+.dp-hero p  { color: var(--dp-muted); margin: 0 0 1.2rem 0; }
+.dp-chain { display: grid; grid-template-columns: repeat(4, 1fr); gap: .75rem; margin: .5rem 0 1.25rem; }
+@media (max-width: 800px) { .dp-chain { grid-template-columns: repeat(2, 1fr); } }
+.dp-step { border: 1px solid var(--dp-border); border-radius: 12px; padding: .85rem 1rem; background: var(--dp-soft); }
+.dp-step .n { font-size: .72rem; letter-spacing: .06em; text-transform: uppercase; color: var(--dp-muted); }
+.dp-step .t { font-weight: 600; margin: .15rem 0; }
+.dp-step .s { font-size: .85rem; color: var(--dp-muted); }
+.dp-dot { display:inline-block; width:.55rem; height:.55rem; border-radius:50%; margin-right:.4rem; vertical-align: middle; }
+.dp-on  { background:#0ca30c; } .dp-off { background:rgba(128,128,128,.6); } .dp-busy { background:#fab219; }
+.dp-card { border: 1px solid var(--dp-border); border-left: 4px solid var(--sev); border-radius: 10px;
+           padding: .7rem 1rem; margin-bottom: .55rem; }
+.dp-card .top { display:flex; justify-content:space-between; gap:1rem; flex-wrap:wrap; font-size:.8rem; color:var(--dp-muted); }
+.dp-card .msg { font-family: ui-monospace, Consolas, monospace; font-size: .9rem; margin: .3rem 0 .2rem; word-break: break-word; }
+.dp-card .cause { font-size: .88rem; }
+.dp-pill { display:inline-block; border:1px solid var(--dp-border); border-radius: 999px; padding: 0 .55rem;
+           font-size:.75rem; margin-right:.3rem; }
+.dp-bars .row { display:grid; grid-template-columns: 7.5rem 1fr 2.5rem; align-items:center; gap:.6rem; margin:.45rem 0; font-size:.88rem; }
+.dp-bars .track { height: .7rem; border-radius: 4px; background: var(--dp-soft); overflow: hidden; }
+.dp-bars .fill { height: 100%; border-radius: 0 4px 4px 0; }
+.dp-bars .v { text-align: right; font-variant-numeric: tabular-nums; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# ── API helpers ───────────────────────────────────────────────────────────────
+
+def api(method: str, path: str, timeout: float = 15, quiet: bool = False, **kwargs):
+    """Call the backend. Returns the Response, or None after showing an error."""
+    url = path if path.startswith("http") else f"{API}{path}"
     try:
-        h = requests.get("http://localhost:8088/health", timeout=2).json()
-        st.success("API online")
-        col1, col2 = st.columns(2)
-        col1.metric("Index", "✅" if h["index_loaded"] else "❌")
-        col2.metric("Monitor", "🟢" if h["monitoring"] else "⚫")
-        st.caption(f"Model: {h['model']}")
-        st.caption(f"Events: {h['events_count']}")
-    except Exception:
-        st.error("⚠ API offline — start with:\nuvicorn app.main:app --port 8088")
-
-    st.divider()
-    page = st.radio(
-        "Navigation",
-        ["⚙️ Setup Index", "📡 Live Monitor", "📋 Event History", "🔧 JIRA Test", "🧪 Log Generator"],
-        label_visibility="collapsed",
-    )
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def api_get(path, timeout=15, **kwargs):
-    try:
-        return requests.get(f"{API}{path}", timeout=timeout, **kwargs)
+        return requests.request(method, url, timeout=timeout, **kwargs)
     except requests.exceptions.Timeout:
-        st.error(f"⏱ Request timed out ({timeout}s). The server is running but took too long.")
-        return None
+        if not quiet:
+            st.error(f"⏱ The API took longer than {timeout:.0f}s to respond.")
     except requests.exceptions.ConnectionError:
-        st.error("🔌 Cannot reach API — is `uvicorn app.main:app --port 8088` running?")
-        return None
+        if not quiet:
+            st.error(f"🔌 Cannot reach the API at `{API_ROOT}` — is `uvicorn app.main:app --port 8088` running?")
     except requests.exceptions.RequestException as e:
-        st.error(f"Request error: {e}")
-        return None
+        if not quiet:
+            st.error(f"Request error: {e}")
+    return None
 
 
-def api_post(path, timeout=60, **kwargs):
-    try:
-        return requests.post(f"{API}{path}", timeout=timeout, **kwargs)
-    except requests.exceptions.Timeout:
-        st.error(f"⏱ Request timed out ({timeout}s).")
-        return None
-    except requests.exceptions.ConnectionError:
-        st.error("🔌 Cannot reach API — is `uvicorn app.main:app --port 8088` running?")
-        return None
-    except requests.exceptions.RequestException as e:
-        st.error(f"Request error: {e}")
-        return None
-
-
-def severity_badge(severity: str) -> str:
-    colors = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}
-    return f"{colors.get(severity, '⚪')} {severity.upper()}"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE 1 — SETUP INDEX
-# ══════════════════════════════════════════════════════════════════════════════
-if page == "⚙️ Setup Index":
-    st.header("⚙️ Step 1 — Index Your Backend Codebase")
-    st.info(
-        "This is a **one-time setup**. Upload your backend source code and the agent "
-        "will extract every function's name, description (from docstrings/comments), "
-        "and source code. This index is saved to `backend_index.json` and reloaded automatically on restart."
-    )
-
-    # Current status
-    resp = api_get("/index/status")
-    if resp and resp.ok:
-        s = resp.json()
-        if s["indexed"]:
-            st.success(
-                f"✅ Index loaded — **{s['total_files']} files**, **{s['total_functions']} functions**  "
-                f"| Root: `{s['root_path']}` | Built: {s.get('created_at', 'unknown')[:19]}"
-            )
-        else:
-            st.warning("No index loaded yet.")
-
-    st.divider()
-    tab_upload, tab_path = st.tabs(["📦 Upload ZIP", "📁 Local Directory Path"])
-
-    with tab_upload:
-        st.subheader("Upload a ZIP of your backend")
-        uploaded = st.file_uploader(
-            "Select your backend ZIP file",
-            type="zip",
-            help="Supports Python, JavaScript, TypeScript, Java, Go",
-        )
-        if st.button("🚀 Build Index from ZIP", disabled=uploaded is None):
-            with st.spinner("Indexing source code — extracting functions and descriptions..."):
-                r = requests.post(
-                    f"{API}/index/upload",
-                    files={"file": (uploaded.name, uploaded.getvalue(), "application/zip")},
-                    timeout=120,
-                )
-            if r.ok:
-                data = r.json()
-                st.success(
-                    f"✅ Index built! **{data['summary']['total_files']} files**, "
-                    f"**{data['summary']['total_functions']} functions**, "
-                    f"**{data['summary']['total_classes']} classes**"
-                )
-                with st.expander("View language breakdown"):
-                    st.json(data["summary"]["languages_detected"])
-                with st.expander("View all dependencies"):
-                    st.write(", ".join(data["summary"]["all_dependencies"]))
-            else:
-                st.error(f"Indexing failed: {r.text[:300]}")
-
-    with tab_path:
-        st.subheader("Index a directory on this server")
-        dir_path = st.text_input("Absolute directory path", placeholder="C:/projects/my-backend")
-        if st.button("🚀 Build Index from Path", disabled=not dir_path):
-            with st.spinner("Indexing..."):
-                r = api_post(f"/index/path?directory={dir_path}")
-            if r and r.ok:
-                data = r.json()
-                st.success(
-                    f"✅ Index built! **{data['summary']['total_files']} files**, "
-                    f"**{data['summary']['total_functions']} functions**"
-                )
-            elif r:
-                st.error(f"Failed: {r.text[:300]}")
-
-    # Show indexed functions sample
-    resp = api_get("/index/status")
-    if resp and resp.ok and resp.json()["indexed"]:
-        st.divider()
-        st.subheader("📖 Index Preview")
-        st.caption("Showing a sample of indexed functions (from saved index file):")
+def get_json(path: str, default=None, timeout: float = 15, quiet: bool = True):
+    r = api("GET", path, timeout=timeout, quiet=quiet)
+    if r is not None and r.ok:
         try:
-            import pathlib
-            idx_path = pathlib.Path("backend_index.json")
-            if idx_path.exists():
-                idx = json.loads(idx_path.read_text())
-                rows = []
-                for f in idx.get("files", [])[:5]:
-                    for fn in f.get("functions", [])[:3]:
-                        rows.append({
-                            "File": f["path"],
-                            "Function": fn["name"],
-                            "Description": fn["description"][:100],
-                            "Lines": f"{fn['start_line']}–{fn['end_line']}",
-                        })
-                if rows:
-                    st.dataframe(rows, use_container_width=True)
-        except Exception as e:
-            st.caption(f"Preview unavailable: {e}")
+            return r.json()
+        except ValueError:
+            pass
+    return default
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE 2 — LIVE MONITOR
-# ══════════════════════════════════════════════════════════════════════════════
-elif page == "📡 Live Monitor":
-    st.header("📡 Step 2 — Monitor Live JSON Logs")
+def error_detail(r) -> str:
+    try:
+        return str(r.json().get("detail", r.text))
+    except ValueError:
+        return r.text[:300]
 
-    # ── Live debug panel ──────────────────────────────────────────────────────
-    dbg_resp = api_get("/monitor/debug")
-    dbg = dbg_resp.json() if dbg_resp and dbg_resp.ok else {}
 
-    is_running = dbg.get("monitor_running", False)
+# ── Formatting helpers ────────────────────────────────────────────────────────
 
-    monitor_type = dbg.get("monitor_type", "log")
-    if is_running:
-        if monitor_type == "health":
-            st.success(f"🟢 Health monitoring active — `{dbg.get('health_url', '')}`")
-        else:
-            st.success(f"🟢 Log monitoring active — `{dbg.get('log_path', '')}`")
-    else:
-        st.warning("⚫ Monitor is stopped.")
+def ev_message(ev: dict) -> str:
+    entry = ev["error"]["log_entry"]
+    return str(entry.get("message") or entry.get("msg") or "No message")
 
-    # Live pipeline counters — always visible
-    c1, c2, c3, c4 = st.columns(4)
-    if monitor_type == "health":
-        c1.metric("Failed checks", dbg.get("health_failures", 0))
-        c2.metric("⏳ Queued (analysing)", dbg.get("errors_queued_for_analysis", 0))
-        c3.metric("✅ Fully analysed", dbg.get("errors_fully_analyzed", 0))
-    else:
-        c1.metric("Errors in log", dbg.get("errors_detected_in_log", 0))
-        c2.metric("⏳ Queued (analysing)", dbg.get("errors_queued_for_analysis", 0))
-        c3.metric("✅ Fully analysed", dbg.get("errors_fully_analyzed", 0))
-    c4.metric("Index functions", dbg.get("index_functions", 0),
-              help="0 = no index loaded; upload in Setup Index tab")
 
-    # Groq key warning
-    if not dbg.get("groq_key_looks_valid", True):
-        st.error(
-            "⚠️ **Groq API key looks invalid** — check `GROQ_API_KEY` in your "
-            "`.env` or `.env.example` file and restart the server. "
-            "Key must start with `gsk_`."
-        )
+def ev_service(ev: dict) -> str:
+    return str(ev["error"]["log_entry"].get("service") or "unknown-service")
 
-    # Last detected error or health failure
-    if dbg.get("last_error_message"):
-        st.info(f"🔎 Last detected: `{dbg['last_error_message']}`")
 
-    # Queued spinner
-    if dbg.get("errors_queued_for_analysis", 0) > 0:
-        st.warning(
-            f"⏳ **{dbg['errors_queued_for_analysis']} error(s) are being analysed by LLM** — "
-            "results will appear below in ~15–30 s each. Page auto-refreshes."
-        )
+def sev_label(sev: str) -> str:
+    return f"{SEVERITY.get(sev, {}).get('icon', '•')} {sev.upper()}"
 
-    st.divider()
-    monitor_mode = st.radio(
-        "Monitor mode",
-        ["Log file watcher", "Health check"],
-        index=0 if monitor_type == "log" else 1,
+
+def event_card(ev: dict) -> None:
+    sev = ev["step2"]["severity"]
+    color = SEVERITY.get(sev, {}).get("color", "#888")
+    jira = ev.get("jira")
+    jira_html = (
+        f'<a href="{html.escape(jira["ticket_url"])}" target="_blank">🎫 {html.escape(jira["ticket_id"])}</a>'
+        if jira else "no ticket"
+    )
+    st.markdown(
+        f"""
+<div class="dp-card" style="--sev:{color}">
+  <div class="top">
+    <span><b>{sev_label(sev)}</b> · {html.escape(ev_service(ev))} · {ev['error']['detected_at'][:19].replace('T', ' ')}</span>
+    <span>confidence {ev['step2']['confidence_score']:.0%} · {jira_html}</span>
+  </div>
+  <div class="msg">{html.escape(ev_message(ev)[:220])}</div>
+  <div class="cause">{html.escape(ev['step2']['root_cause'][:260])}</div>
+</div>
+""",
+        unsafe_allow_html=True,
     )
 
-    col_start, col_stop = st.columns(2)
 
-    with col_start:
-        st.subheader("Start Monitoring")
-        if monitor_mode == "Log file watcher":
-            st.caption("Enter the absolute path to your JSON log file:")
-            log_path_input = st.text_input(
-                "JSON log file path",
-                value="test_logs/live.log",
-                label_visibility="collapsed",
-            )
-            st.caption(
-                "**Test file:**  "
-                "`test_logs/live.log`  "
-                "— generate it first using **🧪 Log Generator**"
-            )
-            payload = {"monitor_type": "log", "log_path": log_path_input}
-            ready_to_start = bool(log_path_input)
-            start_message = "Monitor started — replaying log file..."
+def event_detail(ev: dict) -> None:
+    s1, s2, jira = ev["step1"], ev["step2"], ev.get("jira")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Severity", sev_label(s2["severity"]), border=True)
+    c2.metric("Analysis confidence", f"{s2['confidence_score']:.0%}", border=True)
+    c3.metric("Function match confidence", f"{s1['confidence']:.0%}", border=True)
+    c4.metric("JIRA ticket", jira["ticket_id"] if jira else "—", border=True)
+
+    if jira:
+        st.link_button(f"Open {jira['ticket_id']} in JIRA ↗", jira["ticket_url"])
+
+    st.markdown("#### Root cause")
+    st.write(s2["root_cause"])
+
+    tab_fix, tab_debug, tab_tech, tab_step1, tab_raw = st.tabs(
+        ["🛠 Fixes", "🔎 Debugging steps", "📖 Explanation", "🎯 Suspected functions", "🧾 Raw log"]
+    )
+    with tab_fix:
+        for i, fix in enumerate(s2["possible_fixes"], 1):
+            with st.container(border=True):
+                st.markdown(fix if fix.lower().startswith("fix") else f"**Fix {i}.** {fix}")
+    with tab_debug:
+        for i, step in enumerate(s2["debugging_steps"], 1):
+            st.markdown(f"{i}. {step}")
+    with tab_tech:
+        st.write(s2["technical_explanation"])
+        if s2.get("affected_components"):
+            st.markdown("**Affected components:** " + ", ".join(f"`{c}`" for c in s2["affected_components"]))
+    with tab_step1:
+        if s1["suspected_functions"]:
+            st.markdown(" ".join(f"`{f}`" for f in s1["suspected_functions"]))
         else:
-            st.caption(
-                "Health check polls your site every 3 seconds. "
-                "If the site fails 3 consecutive checks, a JIRA ticket will be created."
+            st.warning(
+                "No indexed function matched this error — the analysis is based on the log entry alone. "
+                "Index the codebase that produced these logs for code-level results."
             )
-            health_url_input = st.text_input(
-                "Health check URL",
-                value="https://example.com/health",
-                label_visibility="collapsed",
-            )
-            st.caption("Enter the URL that should respond successfully to each health check.")
-            payload = {
-                "monitor_type": "health",
-                "health_url": health_url_input,
-                "check_interval_sec": 3,
-                "failure_threshold": 3,
-            }
-            ready_to_start = bool(health_url_input)
-            start_message = "Health monitor started — polling every 3 seconds..."
+        st.caption(s1["reasoning"])
+    with tab_raw:
+        st.json(ev["error"]["log_entry"])
 
-        btn_label = "🔄 Restart" if is_running else "▶️ Start"
-        if st.button(btn_label, disabled=not ready_to_start, type="primary"):
-            if is_running:
-                api_post("/monitor/stop")
-                import time
-                time.sleep(0.5)
-            r = api_post("/monitor/start", json=payload)
-            if r and r.ok:
-                st.success(start_message)
-                st.rerun()
-            elif r:
-                try:
-                    detail = r.json().get("detail", r.text)
-                except Exception:
-                    detail = r.text
-                st.error(f"Failed ({r.status_code}): {detail}")
 
-    with col_stop:
-        st.subheader("Controls")
-        if st.button("⏹ Stop Monitor", disabled=not is_running):
-            r = api_post("/monitor/stop")
-            if r and r.ok:
-                st.info("Monitor stopped.")
-                st.rerun()
-        if st.button("🗑 Clear All Events"):
-            requests.delete(f"{API}/monitor/events", timeout=5)
-            st.rerun()
-
-    st.divider()
-    st.subheader("🔴 Analysed Errors")
-
-    auto_refresh = st.checkbox("Auto-refresh every 4 seconds", value=is_running)
-
-    resp = api_get("/monitor/events?limit=20")
-    events = resp.json() if resp and resp.ok else []
-
-    if not events:
-        if is_running and dbg.get("errors_detected_in_log", 0) > 0:
-            st.info(
-                f"🔄 **{dbg['errors_detected_in_log']} error(s) detected, LLM analysing them...** "
-                "Results appear here once analysis completes (~15–30 s each)."
-            )
-        elif is_running:
-            st.info("Watching for errors. No ERROR/CRITICAL/FATAL lines found yet.")
-        else:
-            st.info("Start the monitor and point it at a log file.")
-    else:
-        for ev in events:
-            msg = (
-                ev["error"]["log_entry"].get("message")
-                or ev["error"]["log_entry"].get("msg", "No message")
-            )
-            sev = ev["step2"]["severity"]
-            with st.expander(
-                f"{severity_badge(sev)}  |  {msg[:90]}  |  {ev['error']['detected_at'][:19]}"
-            ):
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Severity", sev.upper())
-                c2.metric("Confidence", f"{ev['step2']['confidence_score']:.0%}")
-                c3.metric("JIRA", ev["jira"]["ticket_id"] if ev.get("jira") else "—")
-
-                st.markdown(f"**Root Cause:** {ev['step2']['root_cause']}")
-
-                st.markdown("**Suspected Functions (Step 1):**")
-                fns = ev["step1"]["suspected_functions"]
-                st.write(", ".join(f"`{f}`" for f in fns) if fns else "None identified")
-                st.caption(f"Reasoning: {ev['step1']['reasoning']}")
-
-                st.markdown("**Debugging Steps:**")
-                for step in ev["step2"]["debugging_steps"]:
-                    st.markdown(f"- {step}")
-
-                st.markdown("**Possible Fixes:**")
-                for fix in ev["step2"]["possible_fixes"]:
-                    st.markdown(f"- {fix}")
-
-                if ev.get("jira"):
-                    st.success(
-                        f"JIRA: [{ev['jira']['ticket_id']}]({ev['jira']['ticket_url']})"
-                    )
-
-                st.caption("Raw log entry:")
-                st.json(ev["error"]["log_entry"])
-
-    if auto_refresh and (is_running or dbg.get("errors_queued_for_analysis", 0) > 0):
-        time.sleep(4)
-        st.rerun()
+def severity_bars(events: list[dict]) -> None:
+    counts = Counter(ev["step2"]["severity"] for ev in events)
+    peak = max(counts.values(), default=0) or 1
+    rows = []
+    for sev in sorted(SEVERITY, key=lambda s: SEVERITY[s]["rank"]):
+        n = counts.get(sev, 0)
+        pct = n / peak * 100
+        rows.append(
+            f'<div class="row" title="{sev}: {n} incident(s)"><span>{sev_label(sev)}</span>'
+            f'<div class="track"><div class="fill" style="width:{pct:.1f}%;background:{SEVERITY[sev]["color"]}"></div></div>'
+            f'<span class="v">{n}</span></div>'
+        )
+    st.markdown(f'<div class="dp-bars">{"".join(rows)}</div>', unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE 3 — EVENT HISTORY
+# PAGES
 # ══════════════════════════════════════════════════════════════════════════════
-elif page == "📋 Event History":
-    st.header("📋 Event History")
 
-    resp = api_get("/monitor/events?limit=200")
-    events = resp.json() if resp and resp.ok else []
+def page_overview() -> None:
+    health = get_json(f"{API_ROOT}/health", timeout=3)
+    dbg = get_json("/monitor/debug", default={}, timeout=5)
+    events = get_json("/monitor/events?limit=200", default=[])
 
-    if not events:
-        st.info("No analyzed events yet.")
+    st.markdown(
+        '<div class="dp-hero"><h1>🔍 Debug Pipeline</h1>'
+        "<p>Errors in your logs → AI root-cause analysis against your code → a fully triaged JIRA ticket.</p></div>",
+        unsafe_allow_html=True,
+    )
+    if health is None:
+        st.error(f"The API at `{API_ROOT}` is offline. Start it with `uvicorn app.main:app --port 8088`.")
         st.stop()
 
-    st.caption(f"Total events: {len(events)}")
+    tickets = sum(1 for e in events if e.get("jira"))
+    queued = dbg.get("errors_queued_for_analysis", 0)
+    running = dbg.get("monitor_running", False)
+    fn_count = dbg.get("index_functions", 0)
+    target = dbg.get("health_url") if dbg.get("monitor_type") == "health" else dbg.get("log_path")
 
-    # Summary table
-    rows = []
-    for ev in events:
-        msg = (
-            ev["error"]["log_entry"].get("message")
-            or ev["error"]["log_entry"].get("msg", "")
-        )
-        rows.append({
-            "Time": ev["error"]["detected_at"][:19],
-            "Severity": ev["step2"]["severity"].upper(),
-            "Message": msg[:80],
-            "Suspected Functions": ", ".join(ev["step1"]["suspected_functions"]) or "—",
-            "JIRA Ticket": ev["jira"]["ticket_id"] if ev.get("jira") else "—",
-            "Confidence": f"{ev['step2']['confidence_score']:.0%}",
-        })
+    def step(n, title, ok, text, busy=False):
+        dot = "dp-busy" if busy else ("dp-on" if ok else "dp-off")
+        return (f'<div class="dp-step"><div class="n">Step {n}</div>'
+                f'<div class="t"><span class="dp-dot {dot}"></span>{title}</div>'
+                f'<div class="s">{html.escape(text)}</div></div>')
 
-    st.dataframe(rows, use_container_width=True)
-
-    st.divider()
-    st.subheader("Event Detail")
-
-    event_ids = [f"{ev['error']['detected_at'][:19]} — {ev['id'][:8]}" for ev in events]
-    selected = st.selectbox("Select event", event_ids)
-    if selected:
-        idx = event_ids.index(selected)
-        ev = events[idx]
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Severity", ev["step2"]["severity"].upper())
-        c2.metric("Confidence", f"{ev['step2']['confidence_score']:.0%}")
-        c3.metric("Step 1 Confidence", f"{ev['step1']['confidence']:.0%}")
-        c4.metric("JIRA", ev["jira"]["ticket_id"] if ev.get("jira") else "—")
-
-        st.markdown(f"### Root Cause\n{ev['step2']['root_cause']}")
-        st.markdown(f"### Technical Explanation\n{ev['step2']['technical_explanation']}")
-
-        col_l, col_r = st.columns(2)
-        with col_l:
-            st.markdown("**Debugging Steps**")
-            for s in ev["step2"]["debugging_steps"]:
-                st.markdown(f"- {s}")
-        with col_r:
-            st.markdown("**Possible Fixes**")
-            for f in ev["step2"]["possible_fixes"]:
-                st.markdown(f"- {f}")
-
-        st.markdown("**Suspected Functions (Step 1)**")
-        st.write(", ".join(ev["step1"]["suspected_functions"]) or "None")
-        st.caption(ev["step1"]["reasoning"])
-
-        if ev.get("jira"):
-            st.success(
-                f"JIRA ticket **[{ev['jira']['ticket_id']}]({ev['jira']['ticket_url']})** "
-                f"created at {ev['jira']['created_at'][:19]}"
-            )
-
-        with st.expander("Raw log entry JSON"):
-            st.json(ev["error"]["log_entry"])
-
-        with st.expander("Full event JSON"):
-            st.json(ev)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE 4 — JIRA TEST
-# ══════════════════════════════════════════════════════════════════════════════
-elif page == "🔧 JIRA Test":
-    st.header("🔧 JIRA Connection Test")
-    st.info(
-        "Use this page to verify your JIRA credentials and see exactly what "
-        "issue types and priorities are available in your project."
+    st.markdown(
+        '<div class="dp-chain">'
+        + step(1, "Index code", fn_count > 0, f"{fn_count} functions indexed" if fn_count else "No index yet")
+        + step(2, "Monitor", running, (Path(target).name if target and dbg.get("monitor_type") != "health" else target) or "Stopped")
+        + step(3, "AI analysis", len(events) > 0, f"{queued} in queue" if queued else f"{len(events)} analysed", busy=queued > 0)
+        + step(4, "JIRA tickets", tickets > 0, f"{tickets} created")
+        + "</div>",
+        unsafe_allow_html=True,
     )
 
-    if st.button("🔌 Test JIRA Connection", type="primary"):
-        with st.spinner("Connecting to JIRA — this takes up to 30 seconds..."):
-            # Long timeout: JIRA test makes 2 external HTTPS calls to Atlassian
-            r = api_get("/monitor/jira-test", timeout=45)
+    k1, k2, k3, k4 = st.columns(4)
+    urgent = sum(1 for e in events if e["step2"]["severity"] in ("critical", "high"))
+    avg_conf = sum(e["step2"]["confidence_score"] for e in events) / len(events) if events else 0
+    k1.metric("Incidents analysed", len(events), border=True)
+    k2.metric("Critical + high", urgent, border=True)
+    k3.metric("JIRA tickets", tickets, border=True)
+    k4.metric("Avg. confidence", f"{avg_conf:.0%}" if events else "—", border=True)
 
-        if r is None:
-            st.warning(
-                "The API server could not be reached or timed out. "
-                "Make sure `uvicorn app.main:app --port 8088` is running "
-                "and you have restarted it after the latest code update."
-            )
-            st.stop()
+    if not events:
+        st.info("No incidents yet. **1)** Index your code on **Codebase**, **2)** start a monitor on **Live Monitor**.")
+        c1, c2 = st.columns(2)
+        c1.page_link(PAGES["index"], label="Go to Codebase", icon="📦")
+        c2.page_link(PAGES["monitor"], label="Go to Live Monitor", icon="📡")
+        return
 
-        if not r.ok:
-            st.error(f"API returned HTTP {r.status_code}. "
-                     "Restart uvicorn — the `/monitor/jira-test` endpoint may not exist yet.")
-            st.code(r.text[:400])
-            st.stop()
-
-        data = r.json()
-
-        if data.get("ok"):
-                st.success(f"✅ JIRA connected! Logged in as: **{data.get('logged_in_as')}**")
-
-                c1, c2 = st.columns(2)
-                c1.metric("Project", data.get("project_name", "—"))
-                c2.metric("Project Key", data.get("jira_project_key", "—"))
-
-                col_l, col_r = st.columns(2)
-                with col_l:
-                    st.markdown("**Available Issue Types**")
-                    for it in data.get("issue_types", []):
-                        st.markdown(f"- `{it}`")
-                    st.caption(
-                        "If 'Bug' is not listed above, the client will use 'Task' automatically."
-                    )
-
-                with col_r:
-                    st.markdown("**Available Priorities**")
-                    for p in data.get("priorities", []):
-                        st.markdown(f"- `{p}`")
-                    st.caption(
-                        "If 'Highest/High/Medium/Low' don't match, "
-                        "edit SEVERITY_TO_PRIORITY in app/jira/client.py."
-                    )
-
-        else:
-            st.error(f"❌ JIRA connection failed:\n\n`{data.get('error')}`")
-            st.markdown("### Troubleshooting")
-            st.markdown("""
-1. **Wrong API token** — generate a new one at https://id.atlassian.com/manage-profile/security/api-tokens
-2. **Wrong email** — must be the email you log into JIRA with
-3. **Wrong base URL** — must be exactly `https://yourorg.atlassian.net` (no trailing path)
-4. **Wrong project key** — go to JIRA → Project Settings → Details → Key
-5. **Token in quotes** — make sure `.env.example` has NO quotes around the token value
-""")
-
-    st.divider()
-    st.subheader("Current JIRA Config (from .env / .env.example)")
-    # Use a short timeout here — we only want the config fields, not a full connection test
-    try:
-        from app.config import settings as _s
-        st.markdown(f"- **Base URL:** `{_s.jira_base_url}`")
-        st.markdown(f"- **Email:** `{_s.jira_email}`")
-        st.markdown(f"- **Project Key:** `{_s.jira_project_key}`")
-        token_ok = _s.jira_api_token and _s.jira_api_token != "YOUR_JIRA_API_TOKEN"
-        st.markdown(f"- **API Token set:** {'✅ Yes' if token_ok else '❌ No (still placeholder)'}")
-    except Exception:
-        # Fallback: read from API with 45s timeout
-        r2 = api_get("/monitor/jira-test", timeout=45)
-        if r2 and r2.ok:
-            d = r2.json()
-            st.markdown(f"- **Base URL:** `{d.get('jira_base_url', '—')}`")
-            st.markdown(f"- **Email:** `{d.get('jira_email', '—')}`")
-            st.markdown(f"- **Project Key:** `{d.get('jira_project_key', '—')}`")
-            st.markdown(f"- **API Token set:** {'✅ Yes' if d.get('api_token_set') else '❌ No'}")
+    left, right = st.columns([1, 2], gap="large")
+    with left:
+        st.markdown("##### Incidents by severity")
+        severity_bars(events)
+        st.markdown("##### Top services")
+        for svc, n in Counter(ev_service(e) for e in events).most_common(5):
+            st.markdown(f'<span class="dp-pill">{html.escape(svc)}</span> {n}', unsafe_allow_html=True)
+    with right:
+        st.markdown("##### Latest incidents")
+        for ev in events[:5]:
+            event_card(ev)
+        st.page_link(PAGES["incidents"], label="See all incidents", icon="📋")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE 5 — LOG GENERATOR
-# ══════════════════════════════════════════════════════════════════════════════
-elif page == "🧪 Log Generator":
-    import subprocess
-    import sys
-    import os
-
-    st.header("🧪 Fake Log Generator")
-    st.info(
-        "Generate realistic JSON logs — **authentication**, **API requests**, "
-        "**database operations**, **payments**, **cache**, and **worker** events — "
-        "with injected ERROR / CRITICAL / FATAL entries so the pipeline detects them."
+def page_index() -> None:
+    st.title("📦 Codebase index")
+    st.caption(
+        "One-time setup: every function's name, docstring and source is extracted so the AI can match "
+        "errors to real code. Python, JavaScript/TypeScript, Java and Go are supported."
     )
 
-    st.divider()
+    status = get_json("/index/status")
+    if status is None:
+        st.error(f"Cannot reach the API at `{API_ROOT}`.")
+        st.stop()
+    if status["indexed"]:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Files", status["total_files"], border=True)
+        c2.metric("Functions", status["total_functions"], border=True)
+        c3.metric("Built", (status.get("created_at") or "")[:16].replace("T", " "), border=True)
+        st.caption(f"Root: `{status['root_path']}`")
+    else:
+        st.warning("No index yet — build one below.")
 
-    col_cfg, col_preview = st.columns([1, 1])
+    st.subheader("Build or rebuild the index")
+    tab_zip, tab_path = st.tabs(["📦 Upload a ZIP", "📁 Folder on the API server"])
+    result = None
+    with tab_zip:
+        uploaded = st.file_uploader("Backend source as a .zip", type="zip")
+        if st.button("Build index from ZIP", type="primary", disabled=uploaded is None):
+            with st.spinner("Extracting functions…"):
+                r = api("POST", "/index/upload", timeout=180,
+                        files={"file": (uploaded.name, uploaded.getvalue(), "application/zip")})
+            if r is not None and r.ok:
+                result = r.json()
+            elif r is not None:
+                st.error(f"Indexing failed: {error_detail(r)}")
+    with tab_path:
+        dir_path = st.text_input("Absolute folder path", placeholder="C:/projects/my-backend")
+        if st.button("Build index from folder", type="primary", disabled=not dir_path):
+            with st.spinner("Extracting functions…"):
+                r = api("POST", "/index/path", timeout=180, params={"directory": dir_path})
+            if r is not None and r.ok:
+                result = r.json()
+            elif r is not None:
+                st.error(f"Indexing failed: {error_detail(r)}")
+    if result:
+        s = result["summary"]
+        st.success(f"Index built — {s['total_files']} files, {s['total_functions']} functions, "
+                   f"{s['total_classes']} classes, {s['total_routes']} API routes.")
 
-    with col_cfg:
-        st.subheader("Configuration")
-
-        out_path = st.text_input(
-            "Output log file path",
-            value="test_logs/live.log",
-            help="File is APPENDED to if it already exists.",
-        )
-
-        gen_mode = st.radio(
-            "Mode",
-            ["📦 Batch (generate N lines, then stop)", "🔴 Live Stream (continuous, 1 line/interval)"],
-            index=0,
-        )
-
-        if "Batch" in gen_mode:
-            n_lines = st.slider("Number of log lines", min_value=20, max_value=1000, value=150, step=10)
-            interval = 0.0
-        else:
-            n_lines = None
-            interval = st.slider("Interval between lines (seconds)", min_value=0.2, max_value=5.0,
-                                 value=1.0, step=0.1)
-
-        error_rate = st.slider(
-            "Error rate (fraction of ERROR/CRITICAL/FATAL lines)",
-            min_value=0.05, max_value=0.60, value=0.15, step=0.05,
-            format="%.0f%%",
-            help="0.15 = ~15% of lines are errors. Higher = more JIRA tickets created.",
-        )
-
-        st.markdown("---")
-        st.caption("Log types included:")
-        st.markdown(
-            "🔑 **Auth** — login, JWT, OAuth, brute-force  \n"
-            "🌐 **API** — GET/POST requests, rate limits  \n"
-            "🗄️ **Database** — queries, deadlocks, pool exhaustion  \n"
-            "💳 **Payment** — Stripe charges, timeouts, declines  \n"
-            "⚡ **Cache** — Redis hits/misses/errors  \n"
-            "⚙️ **Workers** — Celery tasks, retries, crashes  \n"
-            "🖥️ **System** — health, deploys, backups"
-        )
-
-    with col_preview:
-        st.subheader("Live Preview (sample lines)")
-        if st.button("🔄 Generate Sample Preview", type="secondary"):
-            import sys, os
-            sys.path.insert(0, os.path.abspath("."))
-            try:
-                from log_generator.fake_log_generator import generate_line
-                preview_lines = [generate_line(error_rate) for _ in range(12)]
-                preview_text = "\n".join(preview_lines)
-                st.code(preview_text, language="json")
-            except Exception as e:
-                st.error(f"Preview error: {e}")
-
-        st.markdown("")
-        st.subheader("Log counts")
-        if out_path and os.path.exists(out_path):
-            try:
-                with open(out_path, encoding="utf-8", errors="replace") as f:
-                    all_lines = [l.strip() for l in f if l.strip()]
-                import json as _json
-                total = len(all_lines)
-                errors = 0
-                for line in all_lines:
-                    try:
-                        lvl = _json.loads(line).get("level", "")
-                        if lvl in ("ERROR", "CRITICAL", "FATAL"):
-                            errors += 1
-                    except Exception:
-                        pass
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Total lines", total)
-                m2.metric("Error lines", errors)
-                m3.metric("Error %", f"{errors/total*100:.1f}%" if total else "—")
-            except Exception as e:
-                st.caption(f"Could not read file: {e}")
-        else:
-            st.caption("File does not exist yet — will be created when you generate.")
-
-    st.divider()
-
-    # ── Action buttons ────────────────────────────────────────────────────────
-    ca, cb, cc = st.columns(3)
-
-    gen_script = os.path.abspath(
-        os.path.join(os.path.dirname(__file__) or ".", "..", "log_generator", "fake_log_generator.py")
-    )
-
-    with ca:
-        btn_gen = st.button("▶️ Generate Now", type="primary", use_container_width=True,
-                            disabled=not out_path)
-    with cb:
-        btn_clear = st.button("🗑 Clear Log File", use_container_width=True,
-                              disabled=not out_path)
-    with cc:
-        btn_open_monitor = st.button("📡 Use in Monitor", use_container_width=True,
-                                     help="Switches to Live Monitor page with this file pre-loaded")
-
-    if btn_clear and out_path:
+    # The API saves the index next to where it runs; read it for the browser.
+    idx_file = PROJECT_ROOT / "backend_index.json"
+    if status["indexed"] and idx_file.exists():
         try:
-            open(out_path, "w").close()
-            st.success(f"Cleared: `{out_path}`")
-        except Exception as e:
-            st.error(f"Could not clear: {e}")
+            idx = json.loads(idx_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            st.caption(f"Function browser unavailable: {e}")
+            return
+        st.subheader("Function browser")
+        langs = idx["summary"].get("languages_detected", {})
+        if langs:
+            st.markdown(" ".join(f'<span class="dp-pill">{html.escape(k)} · {v}</span>' for k, v in langs.items()),
+                        unsafe_allow_html=True)
+        rows = [
+            {"Function": fn["name"], "File": f["path"], "Lines": f"{fn['start_line']}–{fn['end_line']}",
+             "Description": fn["description"][:140]}
+            for f in idx.get("files", []) for fn in f.get("functions", [])
+        ]
+        query = st.text_input("Search functions", placeholder="e.g. login, jira, parse")
+        if query:
+            q = query.lower()
+            rows = [r for r in rows if q in r["Function"].lower() or q in r["File"].lower() or q in r["Description"].lower()]
+        st.dataframe(rows, use_container_width=True, hide_index=True, height=380)
+        st.caption(f"{len(rows)} function(s)")
 
-    if btn_open_monitor:
-        st.session_state["monitor_path"] = out_path
-        st.info(f"Go to 📡 Live Monitor and paste:  `{out_path}`")
 
-    if btn_gen and out_path:
-        cmd = [sys.executable, gen_script, "--output", out_path,
-               "--error-rate", str(error_rate)]
-        if n_lines is not None:
-            cmd += ["--count", str(n_lines)]
+def page_monitor() -> None:
+    st.title("📡 Live monitor")
+    dbg = get_json("/monitor/debug", default=None, timeout=5)
+    if dbg is None:
+        st.error(f"Cannot reach the API at `{API_ROOT}`.")
+        st.stop()
+    running = dbg.get("monitor_running", False)
+
+    if not dbg.get("groq_key_looks_valid", True):
+        st.error("`GROQ_API_KEY` looks invalid (must start with `gsk_`). Fix `.env` and restart the API.")
+    if dbg.get("index_functions", 0) == 0:
+        st.warning("No codebase index — the AI can only reason from log text. Build one on **Codebase** first.")
+
+    with st.container(border=True):
+        top_l, top_r = st.columns([3, 1])
+        with top_l:
+            if running:
+                target = dbg.get("health_url") if dbg.get("monitor_type") == "health" else dbg.get("log_path")
+                st.markdown(f'<span class="dp-dot dp-on"></span>**Watching** `{target}`', unsafe_allow_html=True)
+            else:
+                st.markdown('<span class="dp-dot dp-off"></span>**Stopped**', unsafe_allow_html=True)
+        with top_r:
+            if st.button("⏹ Stop", disabled=not running, use_container_width=True):
+                api("POST", "/monitor/stop")
+                st.rerun()
+
+        mode = st.segmented_control(
+            "Source", ["Log file", "Health-check URL"], default="Health-check URL" if dbg.get("monitor_type") == "health" else "Log file",
+        ) or "Log file"
+        if mode == "Log file":
+            default_path = st.session_state.get("monitor_path", "test_logs/live.log")
+            path = st.text_input("JSON log file (absolute, or relative to the project folder)", value=default_path)
+            if path and not Path(path).is_absolute():
+                path = str(PROJECT_ROOT / path)
+            payload = {"monitor_type": "log", "log_path": path}
+            ready = bool(path)
         else:
-            cmd += ["--interval", str(interval)]
+            url = st.text_input("URL to poll", placeholder="https://example.com/health")
+            c1, c2 = st.columns(2)
+            interval = c1.number_input("Check every (s)", 1, 3600, 3)
+            threshold = c2.number_input("Failures before alert", 1, 100, 3)
+            payload = {"monitor_type": "health", "health_url": url,
+                       "check_interval_sec": int(interval), "failure_threshold": int(threshold)}
+            ready = bool(url)
 
-        if "Batch" in gen_mode:
-            with st.spinner(f"Generating {n_lines} log lines into `{out_path}` ..."):
-                try:
-                    result = subprocess.run(
-                        cmd, capture_output=True, text=True, timeout=120,
-                        cwd=os.path.abspath(os.path.join(os.path.dirname(__file__) or ".", ".."))
-                    )
-                    if result.returncode == 0:
-                        st.success(f"✅ Done! {n_lines} lines written to `{out_path}`")
-                        st.caption(result.stderr.strip())
-                    else:
-                        st.error(f"Generator failed:\n{result.stderr[:500]}")
-                except subprocess.TimeoutExpired:
-                    st.error("Generator timed out (>120s).")
-                except Exception as e:
-                    st.error(f"Error running generator: {e}")
-        else:
-            st.warning(
-                "**Live stream mode** cannot run inside Streamlit — it would block the UI.  \n"
-                "Run this command in a **separate terminal** instead:\n"
-            )
-            cmd_str = " ".join(cmd)
-            st.code(cmd_str, language="bash")
-            st.info(
-                "Then go to **📡 Live Monitor**, set the log path to:  \n"
-                f"`{out_path}`  \n"
-                "and click **▶️ Start** — errors will stream in live."
-            )
+        if st.button("🔄 Restart monitor" if running else "▶ Start monitor", type="primary", disabled=not ready):
+            if running:
+                api("POST", "/monitor/stop")
+            r = api("POST", "/monitor/start", json=payload)
+            if r is not None and r.ok:
+                st.rerun()
+            elif r is not None:
+                st.error(f"Could not start ({r.status_code}): {error_detail(r)}")
 
-    st.divider()
-    st.subheader("Quick-start commands")
-    st.caption("Copy and run in a terminal from the `debug_pipeline` folder:")
+    live_feed()
 
-    st.code(
-        "# Batch: 200 lines with 20% error rate\n"
-        "python log_generator/fake_log_generator.py "
-        "--output test_logs/live.log --count 200 --error-rate 0.20\n\n"
-        "# Live stream: 1 line per second, 15% errors\n"
-        "python log_generator/fake_log_generator.py "
-        "--output test_logs/live.log --interval 1.0 --error-rate 0.15\n\n"
-        "# Fast stream: 1 line per 0.5s, print to screen too\n"
-        "python log_generator/fake_log_generator.py "
-        "--output test_logs/live.log --interval 0.5 --stdout",
-        language="bash",
+
+@st.fragment(run_every=4)
+def live_feed() -> None:
+    dbg = get_json("/monitor/debug", default={}, timeout=5)
+    events = get_json("/monitor/events?limit=20", default=[])
+    health_mode = dbg.get("monitor_type") == "health"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Failed checks" if health_mode else "Errors detected",
+              dbg.get("health_failures" if health_mode else "errors_detected_in_log", 0), border=True)
+    c2.metric("Analysing now", dbg.get("errors_queued_for_analysis", 0), border=True)
+    c3.metric("Analysed", dbg.get("errors_fully_analyzed", 0), border=True)
+    c4.metric("JIRA tickets", sum(1 for e in events if e.get("jira")), border=True)
+
+    if dbg.get("errors_queued_for_analysis", 0):
+        st.info(f"⏳ {dbg['errors_queued_for_analysis']} error(s) with the AI — about 10–30 s each.")
+    elif dbg.get("last_error_message"):
+        st.caption(f"Last detected: `{dbg['last_error_message'][:160]}`")
+
+    head_l, head_r = st.columns([4, 1])
+    head_l.markdown("##### Incident feed")
+    if head_r.button("Clear events", use_container_width=True, disabled=not events):
+        api("DELETE", "/monitor/events", timeout=5)
+        st.rerun()
+    if not events:
+        st.caption("Nothing yet — incidents appear here as soon as they are analysed. This view refreshes every 4 s.")
+    for ev in events:
+        event_card(ev)
+
+
+def page_incidents() -> None:
+    st.title("📋 Incidents")
+    events = get_json("/monitor/events?limit=200", default=None)
+    if events is None:
+        st.error(f"Cannot reach the API at `{API_ROOT}`.")
+        st.stop()
+    if not events:
+        st.info("No analysed incidents yet.")
+        return
+
+    f1, f2 = st.columns([2, 3])
+    sev_filter = f1.pills("Severity", list(SEVERITY), selection_mode="multi", default=list(SEVERITY),
+                          format_func=sev_label)
+    query = f2.text_input("Search message, service or root cause")
+    shown = [
+        e for e in events
+        if e["step2"]["severity"] in (sev_filter or [])
+        and (not query or query.lower() in (ev_message(e) + ev_service(e) + e["step2"]["root_cause"]).lower())
+    ]
+    st.caption(f"{len(shown)} of {len(events)} incident(s)")
+    if not shown:
+        return
+
+    rows = [
+        {"Detected": e["error"]["detected_at"][:19].replace("T", " "), "Severity": sev_label(e["step2"]["severity"]),
+         "Service": ev_service(e), "Message": ev_message(e)[:90],
+         "Confidence": e["step2"]["confidence_score"],
+         "JIRA": e["jira"]["ticket_url"] if e.get("jira") else None}
+        for e in shown
+    ]
+    sel = st.dataframe(
+        rows, use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row",
+        column_config={
+            "Confidence": st.column_config.ProgressColumn(format="percent", min_value=0, max_value=1),
+            "JIRA": st.column_config.LinkColumn(display_text=r"browse/(.*)$"),
+        },
     )
+    picked = sel.selection.rows[0] if sel.selection.rows else 0
+    st.divider()
+    st.caption("Select a row above to inspect it.")
+    st.subheader(ev_message(shown[picked])[:120])
+    event_detail(shown[picked])
+
+
+def page_settings() -> None:
+    st.title("⚙️ Settings & connections")
+    health = get_json(f"{API_ROOT}/health", timeout=3)
+    dbg = get_json("/monitor/debug", default={}, timeout=5)
+
+    c1, c2 = st.columns(2)
+    with c1.container(border=True):
+        st.markdown("**Backend API**")
+        if health:
+            st.markdown(f'<span class="dp-dot dp-on"></span>Online at `{API_ROOT}`', unsafe_allow_html=True)
+            st.caption(f"Model: `{health['model']}`")
+        else:
+            st.markdown(f'<span class="dp-dot dp-off"></span>Offline (`{API_ROOT}`)', unsafe_allow_html=True)
+    with c2.container(border=True):
+        st.markdown("**Groq API key**")
+        ok = dbg.get("groq_key_looks_valid")
+        st.markdown(f'<span class="dp-dot {"dp-on" if ok else "dp-off"}"></span>'
+                    f'{"Looks valid" if ok else "Missing or invalid"} · `{dbg.get("groq_key_preview", "—")}`',
+                    unsafe_allow_html=True)
+
+    st.subheader("JIRA")
+    st.caption("Reads `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` and `JIRA_PROJECT_KEY` from `.env`. "
+               "Restart the API after changing them.")
+    if st.button("🔌 Test JIRA connection", type="primary"):
+        with st.spinner("Contacting Atlassian…"):
+            data = get_json("/monitor/jira-test", default=None, timeout=45, quiet=False)
+        if data is None:
+            st.stop()
+        if data.get("ok"):
+            st.success(f"Connected as **{data.get('logged_in_as')}** to **{data.get('project_name')}** "
+                       f"(`{data.get('jira_project_key')}`) at {data.get('jira_base_url')}")
+            a, b = st.columns(2)
+            a.markdown("**Issue types:** " + ", ".join(f"`{t}`" for t in data.get("issue_types", [])))
+            if "Bug" not in data.get("issue_types", []):
+                a.caption("No `Bug` type in this project — tickets are created as `Task`.")
+            b.markdown("**Priorities:** " + ", ".join(f"`{p}`" for p in data.get("priorities", [])))
+        else:
+            st.error(f"JIRA connection failed: `{data.get('error')}`")
+            st.markdown(
+                "- **Base URL** must be just `https://<site>.atlassian.net`\n"
+                "- **Email** is the one you log in to Atlassian with\n"
+                "- **API token**: create one at https://id.atlassian.com/manage-profile/security/api-tokens\n"
+                "- **Project key** is the prefix of ticket IDs (e.g. `KAN` in `KAN-1`)"
+            )
+
+
+def page_generator() -> None:
+    st.title("🧪 Test log generator")
+    st.caption("Writes realistic JSON logs (auth, API, database, payments, cache, workers) with injected "
+               "ERROR / CRITICAL / FATAL lines, so you can watch the pipeline work end to end.")
+    script = PROJECT_ROOT / "log_generator" / "fake_log_generator.py"
+
+    left, right = st.columns(2, gap="large")
+    with left:
+        out_path = st.text_input("Output file (appended to)", value="test_logs/live.log")
+        n_lines = st.slider("Lines to write", 10, 1000, 50, step=10)
+        error_rate = st.slider("Error rate", 0.05, 0.60, 0.15, step=0.05,
+                               help="Every error becomes an AI analysis and, with JIRA configured, a ticket.")
+        est = round(n_lines * error_rate)
+        st.caption(f"≈ {est} error line(s) → ≈ {est} AI analyses" + (" and JIRA tickets." if est else "."))
+
+        b1, b2, b3 = st.columns(3)
+        gen = b1.button("▶ Generate", type="primary", use_container_width=True, disabled=not out_path)
+        clear = b2.button("Clear file", use_container_width=True, disabled=not out_path)
+        use = b3.button("Monitor it", use_container_width=True, disabled=not out_path)
+
+    full_path = Path(out_path) if Path(out_path).is_absolute() else PROJECT_ROOT / out_path
+    if gen:
+        with st.spinner(f"Writing {n_lines} lines…"):
+            res = subprocess.run(
+                [sys.executable, str(script), "--output", str(full_path), "--count", str(n_lines),
+                 "--interval", "0", "--error-rate", str(error_rate)],
+                capture_output=True, text=True, timeout=120, cwd=PROJECT_ROOT,
+            )
+        if res.returncode == 0:
+            left.success(f"Wrote {n_lines} lines to `{out_path}`.")
+        else:
+            left.error(f"Generator failed: {res.stderr[-500:]}")
+    if clear:
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text("", encoding="utf-8")
+        left.success(f"Cleared `{out_path}`.")
+    if use:
+        st.session_state["monitor_path"] = out_path
+        st.switch_page(PAGES["monitor"])
+
+    with right:
+        st.markdown("##### File contents")
+        if full_path.exists():
+            lines = [l for l in full_path.read_text(encoding="utf-8", errors="replace").splitlines() if l.strip()]
+            errs = 0
+            for line in lines:
+                try:
+                    errs += json.loads(line).get("level") in ("ERROR", "CRITICAL", "FATAL")
+                except ValueError:
+                    pass
+            m1, m2 = st.columns(2)
+            m1.metric("Lines", len(lines), border=True)
+            m2.metric("Error lines", errs, border=True)
+            st.code("\n".join(lines[-8:]) or "(empty)", language="json")
+        else:
+            st.caption("File doesn't exist yet — it is created on first generate.")
+
+    with st.expander("Live stream from a terminal"):
+        st.code(f'python log_generator/fake_log_generator.py --output {out_path} --interval 1.0 --error-rate 0.15',
+                language="bash")
+        st.caption("Streams one line per second until you press Ctrl+C. Start the monitor on the same file first.")
+
+
+# ── Navigation ────────────────────────────────────────────────────────────────
+
+PAGES = {
+    "overview":  st.Page(page_overview,  title="Overview",     icon="🏠", default=True),
+    "monitor":   st.Page(page_monitor,   title="Live Monitor", icon="📡", url_path="monitor"),
+    "incidents": st.Page(page_incidents, title="Incidents",    icon="📋", url_path="incidents"),
+    "index":     st.Page(page_index,     title="Codebase",     icon="📦", url_path="codebase"),
+    "generator": st.Page(page_generator, title="Test Logs",    icon="🧪", url_path="test-logs"),
+    "settings":  st.Page(page_settings,  title="Settings",     icon="⚙️", url_path="settings"),
+}
+
+with st.sidebar:
+    st.markdown("### 🔍 Debug Pipeline")
+    st.caption("AI root-cause analysis → JIRA")
+    h = get_json(f"{API_ROOT}/health", timeout=2)
+    if h:
+        st.markdown(
+            f'<span class="dp-dot dp-on"></span>API online<br>'
+            f'<span class="dp-dot {"dp-on" if h["monitoring"] else "dp-off"}"></span>'
+            f'Monitor {"running" if h["monitoring"] else "stopped"}<br>'
+            f'<span class="dp-dot {"dp-on" if h["index_loaded"] else "dp-off"}"></span>'
+            f'Index {"loaded" if h["index_loaded"] else "missing"}',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown('<span class="dp-dot dp-off"></span>API offline', unsafe_allow_html=True)
+
+nav = st.navigation(
+    {"Dashboard": [PAGES["overview"], PAGES["monitor"], PAGES["incidents"]],
+     "Setup": [PAGES["index"], PAGES["generator"], PAGES["settings"]]},
+)
+nav.run()
