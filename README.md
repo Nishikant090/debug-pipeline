@@ -81,6 +81,16 @@ All settings live in `.env` (template: [`.env.example`](.env.example)). Restart 
 
 Use **Settings → Test JIRA connection** to verify the credentials. Tickets are created as `Bug`, falling back to `Task` if the project has no `Bug` type. If JIRA rejects a field, the client retries with fewer fields instead of failing.
 
+## Deploy on Render
+
+The repo includes a [`render.yaml`](render.yaml) Blueprint. It runs one free web service that starts the API privately on `127.0.0.1:8088` and serves the dashboard on the public URL ([`render_start.sh`](render_start.sh)).
+
+1. On [Render](https://dashboard.render.com), choose **New → Blueprint** and connect this GitHub repo.
+2. Fill in the secrets Render asks for: `GROQ_API_KEY`, plus the four `JIRA_*` values to create tickets.
+3. Click **Apply**. The first build takes a few minutes.
+
+On the free plan, the service sleeps after 15 minutes without traffic, and the next visit takes about a minute to wake it. The disk is reset on every restart, so incidents are cleared and the repo's own `app/` folder is re-indexed automatically. If the URL is public, anyone can use the dashboard, which spends your Groq quota and creates tickets in your JIRA project.
+
 ## Standalone demo (no backend)
 
 [`demo_app.py`](demo_app.py) is a self-contained Streamlit app that calls the indexer and analyzer in-process. It needs no FastAPI server, so it can be deployed as-is on Streamlit Community Cloud. One click indexes this repo's `app/` folder, and you then pick a sample error (or paste your own JSON log line) to run the real pipeline.
