@@ -13,11 +13,11 @@ for _ in $(seq 1 60); do
 done
 
 # Render's disk is ephemeral, so the index is gone after every restart or
-# deploy. Index this repo's own app/ folder so the dashboard isn't empty.
+# deploy. Index the bundled ShopFlow demo backend so the dashboard is ready to demo.
 if ! curl -sf "$API/api/v1/index/status" | grep -q '"indexed":true'; then
   # Relative to the API's working directory (the repo root)
-  curl -sf -X POST -G --data-urlencode "directory=app" "$API/api/v1/index/path" >/dev/null \
-    && echo "Indexed app/" || echo "Auto-index failed; build it from the Codebase page"
+  curl -sf -X POST -G --data-urlencode "directory=sample_backend" "$API/api/v1/index/path" >/dev/null \
+    && echo "Indexed sample_backend/" || echo "Auto-index failed; build it from the Codebase page"
 fi
 
 exec streamlit run frontend/streamlit_app.py \

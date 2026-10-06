@@ -9,6 +9,9 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.6
+      # Auto-fix may only write into the bundled demo backend, never the app itself
+      - key: FIX_APPLY_ROOT
+        value: sample_backend
       # Secrets — Render asks for these when you create the Blueprint
       - key: GROQ_API_KEY
         sync: false

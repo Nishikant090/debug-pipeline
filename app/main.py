@@ -5,11 +5,11 @@ Full pipeline:
   1. Index your backend code once  →  /api/v1/index/upload
   2. Start monitoring a JSON log   →  /api/v1/monitor/start
   3. Errors auto-trigger two-step LLM analysis + JIRA ticket creation
+  4. Optionally generate and apply a code fix  →  /api/v1/fix/{event_id}
 """
 import logging
 import time
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,7 +17,8 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.indexer.service import IndexingService
-from app.routers import index_router, monitor_router
+from app.routers import fix_router, index_router, monitor_router
+from app.routers.index_router import INDEX_SAVE_PATH
 from app.state import state
 from app.utils.logger import get_logger
 
@@ -26,8 +27,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = get_logger("debug_pipeline")
-
-INDEX_SAVE_PATH = Path("backend_index.json")
 
 
 @asynccontextmanager
@@ -56,7 +55,8 @@ app = FastAPI(
         "**Workflow**:\n"
         "1. `POST /api/v1/index/upload` — index your backend codebase (one-time)\n"
         "2. `POST /api/v1/monitor/start` — start watching a live JSON log file\n"
-        "3. Errors auto-trigger two-step LLM analysis and JIRA ticket creation"
+        "3. Errors auto-trigger two-step LLM analysis and JIRA ticket creation\n"
+        "4. `POST /api/v1/fix/{event_id}` — optionally generate, apply or revert a code fix"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -71,6 +71,7 @@ app.add_middleware(
 
 app.include_router(index_router.router, prefix="/api/v1")
 app.include_router(monitor_router.router, prefix="/api/v1")
+app.include_router(fix_router.router, prefix="/api/v1")
 
 
 @app.middleware("http")
@@ -96,4 +97,5 @@ async def health():
         "index_loaded": state.index is not None,
         "monitoring": state.is_monitoring,
         "events_count": len(state.events),
+        "fix_apply_enabled": settings.allow_fix_apply,
     }

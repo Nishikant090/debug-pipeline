@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     # Log monitoring
     error_levels: list[str] = ["ERROR", "CRITICAL", "FATAL"]
 
+    # Auto-fix: let the dashboard write generated patches into the indexed folder.
+    # Turn off on public deployments; patches can still be downloaded.
+    allow_fix_apply: bool = True
+    # If set, Apply only writes inside this folder (absolute, or relative to the
+    # API's working directory). Use it on public deployments to protect the app's own code.
+    fix_apply_root: str = ""
+
     # Email notifications (owner-side — sent when a visitor creates a JIRA
     # ticket via the demo app; separate from any JIRA credentials the
     # visitor supplies themselves)

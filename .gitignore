@@ -14,6 +14,12 @@ venv/
 .env.*
 !.env.example
 
+# Claude Code
+.claude/
+
+# Demo archive (build from sample_backend/)
+sample_backend.zip
+
 # Streamlit
 .streamlit/secrets.toml
 

@@ -21,6 +21,7 @@ flowchart LR
    - **Identify:** the error plus the function *index* goes to the LLM, which names the most likely culprits.
    - **Analyze:** the *actual source* of those functions goes back for a full diagnosis covering root cause, technical explanation, debugging steps, fixes, severity, confidence and affected components.
 4. **Report.** A JIRA ticket is created with the whole analysis in its description, plus a plain-text backup comment.
+5. **Fix (on demand).** From an incident, **Auto-fix** asks the LLM to rewrite the suspected functions and shows the result as a diff. You can download it as a `.patch`, or apply it to the indexed folder and revert it later.
 
 ## Dashboard
 
@@ -30,7 +31,7 @@ The Streamlit dashboard (`frontend/streamlit_app.py`) talks to the FastAPI backe
 |---|---|
 | 🏠 **Overview** | Pipeline status (index → monitor → AI → JIRA), incident KPIs, severity breakdown, latest incidents |
 | 📡 **Live Monitor** | Start/stop log or health-check monitoring; live incident feed that refreshes every 4 s |
-| 📋 **Incidents** | Filter by severity, search, then open any incident to see its fixes, debugging steps, explanation, suspected functions and raw log; links straight to its JIRA ticket |
+| 📋 **Incidents** | Filter by severity, search, then open any incident to see its fixes, an auto-generated code patch, debugging steps, explanation, suspected functions and raw log; links straight to its JIRA ticket |
 | 📦 **Codebase** | Build the index from a ZIP upload or a folder; searchable browser of every indexed function |
 | 🧪 **Test Logs** | Generate realistic fake logs with injected errors to try the pipeline end to end |
 | ⚙️ **Settings** | Check the API, Groq key and JIRA connection (lists your project's issue types and priorities) |
@@ -59,9 +60,17 @@ streamlit run frontend/streamlit_app.py       # dashboard    → http://localhos
 
 ### Try it in 2 minutes
 
-1. **Codebase** → *Folder on the API server* → enter the absolute path of your backend (or this repo's `app/` folder) → **Build index**.
-2. **Test Logs** → **Generate** (50 lines, 15% errors) → **Monitor it**.
-3. **Start monitor**, then watch incidents appear on **Live Monitor** (about 10–30 s each) and open them on **Incidents**.
+The repo ships with a demo pair that belong together:
+
+- [`sample_backend/`](sample_backend/): **ShopFlow**, a small, intentionally buggy e-commerce backend (auth, database, payments, cache, API, workers). Its files and functions match the tracebacks below.
+- [`sample_logs/shopflow.log`](sample_logs/shopflow.log): 24 log lines with 6 errors, each pointing into `sample_backend/`.
+
+1. **Codebase** → *Folder on the API server* → enter the absolute path of `sample_backend` → **Build index** (23 files, 45 functions).
+2. **Live Monitor** → log file `sample_logs/shopflow.log` → **Start monitor**.
+3. Watch the 6 incidents appear (about 10–30 s each) and open them on **Incidents**. Each one names the function where the bug lives, for example `dispatch` in `api/middleware.py` for the `NoneType … 'user_id'` error.
+4. Open the **🩹 Auto-fix** tab → **Generate fix** to see the code change as a diff. **Apply to files** writes it into `sample_backend/`; **Revert** puts the buggy demo code back.
+
+For a live stream, use **Test Logs** → **Generate** → **Monitor it**. The generator's errors also match functions in `sample_backend/`.
 
 > **Tip:** Step 1 can only point at real functions if you index the code that *produced* the logs. With an unrelated index, the analysis falls back to reasoning from the log text alone, and the *Suspected functions* tab says so.
 
@@ -77,6 +86,7 @@ All settings live in `.env` (template: [`.env.example`](.env.example)). Restart 
 | `JIRA_API_TOKEN` | for tickets | [id.atlassian.com → API tokens](https://id.atlassian.com/manage-profile/security/api-tokens) |
 | `JIRA_PROJECT_KEY` | for tickets | Ticket prefix, e.g. `KAN` for `KAN-1` (also in the board URL after `/projects/`) |
 | `SMTP_USERNAME`, `SMTP_APP_PASSWORD`, `NOTIFY_EMAIL` | optional | Gmail + [App Password](https://myaccount.google.com/apppasswords); used by `demo_app.py` to email you when a ticket is created |
+| `ALLOW_FIX_APPLY` | optional | `true` by default. Set `false` to stop the dashboard writing patches to disk (patches can still be downloaded) |
 | `DEBUG_PIPELINE_API` | optional | Dashboard → API address if the API isn't on `http://127.0.0.1:8088` |
 
 Use **Settings → Test JIRA connection** to verify the credentials. Tickets are created as `Bug`, falling back to `Task` if the project has no `Bug` type. If JIRA rejects a field, the client retries with fewer fields instead of failing.
@@ -89,7 +99,7 @@ The repo includes a [`render.yaml`](render.yaml) Blueprint. It runs one free web
 2. Fill in the secrets Render asks for: `GROQ_API_KEY`, plus the four `JIRA_*` values to create tickets.
 3. Click **Apply**. The first build takes a few minutes.
 
-On the free plan, the service sleeps after 15 minutes without traffic, and the next visit takes about a minute to wake it. The disk is reset on every restart, so incidents are cleared and the repo's own `app/` folder is re-indexed automatically. If the URL is public, anyone can use the dashboard, which spends your Groq quota and creates tickets in your JIRA project.
+On the free plan, the service sleeps after 15 minutes without traffic, and the next visit takes about a minute to wake it. The disk is reset on every restart, so incidents are cleared and `sample_backend/` is re-indexed automatically. If the URL is public, anyone can use the dashboard, which spends your Groq quota and creates tickets in your JIRA project. **Apply to files** writes into whichever folder is indexed, and any visitor can choose that folder, so set `ALLOW_FIX_APPLY=false` on a public URL. Downloading patches still works.
 
 ## Standalone demo (no backend)
 
@@ -132,6 +142,9 @@ Interactive docs: `http://127.0.0.1:8088/docs`
 | `GET /api/v1/monitor/events` | Analysed incidents, newest first |
 | `GET /api/v1/monitor/events/{id}` | One incident |
 | `DELETE /api/v1/monitor/events` | Clear stored incidents |
+| `POST /api/v1/fix/{id}` | Generate a code patch for an incident (needs an index) |
+| `POST /api/v1/fix/{id}/apply` | Write the patch to the indexed folder, then re-index |
+| `POST /api/v1/fix/{id}/revert` | Restore the files an applied patch changed, then re-index |
 | `GET /api/v1/monitor/jira-test` | Verify JIRA credentials; list issue types and priorities |
 | `GET /health` | Service health |
 
@@ -141,10 +154,12 @@ Interactive docs: `http://127.0.0.1:8088/docs`
 - **Safe ZIP upload.** Every archive member is checked against "Zip Slip" path traversal, with caps on entry count, decompressed size and upload size.
 - **Bounded LLM input.** Oversized function bodies and log entries are truncated before they reach the model.
 - **Bounded indexing.** At most 8,000 files are indexed, so pointing at a huge directory can't hang the server.
+- **Guarded auto-fix.** A patch only replaces the exact lines of the functions it rewrites. It is written only if those lines still match the index, Python files must still parse, every file is checked before any is written, and line endings are preserved. Revert refuses if the file was edited after applying. Set `FIX_APPLY_ROOT` to stop Apply writing outside one folder (the Render Blueprint limits it to `sample_backend/`).
 - **Validated input.** Monitor parameters are bounds-checked (`422` on bad values), and `demo_app.py` rejects empty, invalid or non-object JSON with a clear message.
 
 ## Known limitations
 
+- **Revert lasts one session.** Fixes are kept in memory, so after an API restart (or once an incident is pushed out of the 500-event history) an applied fix can't be reverted from the dashboard. Use git or the downloaded `.patch` to undo it.
 - Incidents are kept **in memory** and are lost when the API restarts. The code index is persisted to `backend_index.json`.
 - **No de-duplication yet:** the same error appearing twice is analysed twice and produces two tickets.
 - JIRA priority is mapped from severity only on `Bug` tickets. The `Task` fallback (used when a project has no `Bug` type, as in default Kanban projects) omits priority, so those tickets get the project's default priority. Severity is still in the ticket title and description.
@@ -153,12 +168,13 @@ Interactive docs: `http://127.0.0.1:8088/docs`
 
 ```
 app/
-├── analyzer/two_step_analyzer.py   # Two-step LLM analysis (identify → analyze)
+├── analyzer/two_step_analyzer.py   # Two-step LLM analysis (identify → analyze) + fix generation
+├── analyzer/patcher.py             # Turns generated fixes into diffs; applies and reverts them
 ├── indexer/                        # Index builder + parsers for Python, JS/TS, Java, Go
 ├── jira/client.py                  # JIRA ticket creation with field/issue-type fallbacks
 ├── monitor/log_watcher.py          # JSON log tailing
 ├── notifier/email_notifier.py      # Gmail SMTP owner notification
-├── routers/                        # FastAPI endpoints (index, monitor)
+├── routers/                        # FastAPI endpoints (index, monitor, fix)
 ├── config.py                       # Settings loaded from .env
 ├── models.py                       # Pydantic models (index, events, analysis, tickets)
 ├── state.py                        # In-memory shared state
@@ -166,7 +182,9 @@ app/
 frontend/streamlit_app.py           # Dashboard (talks to the API over HTTP)
 demo_app.py                         # Standalone demo, no backend needed
 log_generator/fake_log_generator.py # Realistic fake JSON logs for testing
-sample_logs/app.log                 # Small sample log (3 errors)
+sample_backend/                     # ShopFlow: buggy demo backend to index
+sample_logs/shopflow.log            # Demo log matching sample_backend (6 errors)
+sample_logs/app.log                 # Small generic sample log (3 errors)
 docs/                               # README screenshots
 ```
 

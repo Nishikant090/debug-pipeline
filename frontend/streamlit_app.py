@@ -163,13 +163,15 @@ def event_detail(ev: dict) -> None:
     st.markdown("#### Root cause")
     st.write(s2["root_cause"])
 
-    tab_fix, tab_debug, tab_tech, tab_step1, tab_raw = st.tabs(
-        ["🛠 Fixes", "🔎 Debugging steps", "📖 Explanation", "🎯 Suspected functions", "🧾 Raw log"]
+    tab_fix, tab_auto, tab_debug, tab_tech, tab_step1, tab_raw = st.tabs(
+        ["🛠 Fixes", "🩹 Auto-fix", "🔎 Debugging steps", "📖 Explanation", "🎯 Suspected functions", "🧾 Raw log"]
     )
     with tab_fix:
         for i, fix in enumerate(s2["possible_fixes"], 1):
             with st.container(border=True):
                 st.markdown(fix if fix.lower().startswith("fix") else f"**Fix {i}.** {fix}")
+    with tab_auto:
+        auto_fix(ev)
     with tab_debug:
         for i, step in enumerate(s2["debugging_steps"], 1):
             st.markdown(f"{i}. {step}")
@@ -188,6 +190,66 @@ def event_detail(ev: dict) -> None:
         st.caption(s1["reasoning"])
     with tab_raw:
         st.json(ev["error"]["log_entry"])
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fix_apply_enabled() -> bool:
+    """Server setting; cached so the Auto-fix tab doesn't hit /health on every rerun."""
+    return (get_json(f"{API_ROOT}/health", default={}, timeout=3) or {}).get("fix_apply_enabled", True)
+
+
+def fix_action(ev: dict, action: str, spinner: str, timeout: float = 30) -> None:
+    """POST to a /fix endpoint, then rerun so the incident shows the new fix state."""
+    path = f"/fix/{ev['id']}" + (f"/{action}" if action != "generate" else "")
+    with st.spinner(spinner):
+        r = api("POST", path, timeout=timeout)
+    if r is not None and r.ok:
+        st.rerun()
+    elif r is not None:
+        st.error(error_detail(r))
+
+
+def auto_fix(ev: dict) -> None:
+    fix = ev.get("fix")
+    if not ev["step1"]["suspected_functions"]:
+        st.info("Auto-fix rewrites the functions matched in Step 1, and none were matched for this incident.")
+        return
+    if fix is None:
+        st.caption("The AI rewrites the suspected functions to fix the root cause. You review the diff "
+                   "before anything is written to disk.")
+        if st.button("🩹 Generate fix", type="primary", key=f"fixgen-{ev['id']}"):
+            fix_action(ev, "generate", "Writing the fix… (10–40 s)", timeout=150)
+        return
+
+    st.markdown(f"**{fix['summary']}**")
+    if not fix["edits"]:
+        st.info("No code change was proposed for the indexed functions.")
+    else:
+        files = sorted({e["file_path"] for e in fix["edits"]})
+        st.caption(f"Changes {len(fix['edits'])} function(s) in " + ", ".join(f"`{f}`" for f in files))
+        st.code(fix["diff"], language="diff")
+
+    applied = fix.get("applied_at")
+    if applied:
+        st.success(f"Applied at {applied[:19].replace('T', ' ')} UTC. The index was rebuilt.")
+    elif fix["edits"] and not fix["can_apply"]:
+        st.warning(fix["apply_blocker"])
+
+    b1, b2, b3 = st.columns(3)
+    if fix["edits"]:
+        b1.download_button("⬇ Download .patch", fix["diff"], file_name=f"fix-{ev['id'][:8]}.patch",
+                           mime="text/x-diff", use_container_width=True, key=f"fixdl-{ev['id']}")
+    if applied:
+        if b2.button("↩ Revert", use_container_width=True, key=f"fixrev-{ev['id']}"):
+            fix_action(ev, "revert", "Restoring the original files…")
+    else:
+        apply_enabled = fix_apply_enabled()
+        if b2.button("✅ Apply to files", type="primary", use_container_width=True, key=f"fixapp-{ev['id']}",
+                     disabled=not (fix["can_apply"] and apply_enabled),
+                     help=None if apply_enabled else "Turned off on this server (ALLOW_FIX_APPLY=false)."):
+            fix_action(ev, "apply", "Writing files and re-indexing…")
+        if b3.button("🔁 Regenerate", use_container_width=True, key=f"fixregen-{ev['id']}"):
+            fix_action(ev, "generate", "Writing the fix… (10–40 s)", timeout=150)
 
 
 def severity_bars(events: list[dict]) -> None:
@@ -465,6 +527,7 @@ def page_incidents() -> None:
     ]
     sel = st.dataframe(
         rows, use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row",
+        key="incident_table",
         column_config={
             "Confidence": st.column_config.ProgressColumn(format="percent", min_value=0, max_value=1),
             "JIRA": st.column_config.LinkColumn(display_text=r"browse/(.*)$"),

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from pathlib import Path
 from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
@@ -75,6 +76,37 @@ class Step2Result(BaseModel):
     affected_components: list[str] = []
 
 
+# ── Auto-fix models ────────────────────────────────────────────────────────────
+
+class FunctionEdit(BaseModel):
+    """One function rewritten by the auto-fix step."""
+    function: str
+    file_path: str                   # index-relative, e.g. "/api/middleware.py"
+    start_line: int
+    end_line: int
+    original_source: str
+    new_source: str
+
+
+class FileChange(BaseModel):
+    """Whole-file before/after text, kept server-side so apply/revert are exact."""
+    path: Path
+    original: str
+    patched: str
+
+
+class FixProposal(BaseModel):
+    """A code patch for one incident, generated on demand."""
+    summary: str
+    edits: list[FunctionEdit] = []
+    diff: str = ""                   # unified diff, applies with `git apply` from the indexed root
+    can_apply: bool = False
+    apply_blocker: str = ""          # why the patch can't be written to disk, if it can't
+    created_at: str
+    applied_at: Optional[str] = None
+    file_changes: list[FileChange] = Field(default=[], exclude=True)
+
+
 # ── JIRA model ─────────────────────────────────────────────────────────────────
 
 class JiraTicketInfo(BaseModel):
@@ -92,6 +124,7 @@ class AnalyzedEvent(BaseModel):
     step1: Step1Result
     step2: Step2Result
     jira: Optional[JiraTicketInfo] = None
+    fix: Optional[FixProposal] = None
     analyzed_at: str
 
 
