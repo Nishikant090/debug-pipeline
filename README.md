@@ -38,9 +38,15 @@ The Streamlit dashboard (`frontend/streamlit_app.py`) talks to the FastAPI backe
 
 ![Incidents page](docs/incidents.png)
 
-## Quick start
+## Run the whole project
 
-**Requirements:** Python 3.10+, a free [Groq API key](https://console.groq.com/keys), and optionally a free [JIRA Cloud](https://www.atlassian.com/software/jira/free) site.
+### 1. Requirements
+
+- **Python 3.10+** (check with `python --version`)
+- A free **Groq API key**: [console.groq.com/keys](https://console.groq.com/keys)
+- *Optional:* a free **JIRA Cloud** site, if you want tickets: [atlassian.com/software/jira/free](https://www.atlassian.com/software/jira/free)
+
+### 2. Install (once)
 
 ```bash
 git clone https://github.com/Nishikant090/debug-pipeline.git
@@ -51,28 +57,91 @@ pip install -r requirements.txt
 copy .env.example .env         # macOS/Linux: cp .env.example .env
 ```
 
-Fill in `.env` (see [Configuration](#configuration)), then start the two processes in separate terminals:
+### 3. Configure
 
-```bash
-uvicorn app.main:app --port 8088              # backend API  → http://127.0.0.1:8088/docs
-streamlit run frontend/streamlit_app.py       # dashboard    → http://localhost:8501
+Open `.env` and set at least:
+
+```ini
+GROQ_API_KEY=gsk_your_key_here
 ```
 
-### Try it in 2 minutes
+To get JIRA tickets, also fill in `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` and `JIRA_PROJECT_KEY` (see [Configuration](#configuration)). Without them, everything still works, but no tickets are created.
 
-The repo ships with a demo pair that belong together:
+### 4. Start the two processes
 
-- [`sample_backend/`](sample_backend/): **ShopFlow**, a small, intentionally buggy e-commerce backend (auth, database, payments, cache, API, workers). Its files and functions match the tracebacks below.
-- [`sample_logs/shopflow.log`](sample_logs/shopflow.log): 24 log lines with 6 errors, each pointing into `sample_backend/`.
+The project is two programs: the **API** (does the indexing, monitoring and AI work) and the **dashboard** (the web UI). Run each in its own terminal, with the virtual environment activated in both:
 
-1. **Codebase** → *Folder on the API server* → enter the absolute path of `sample_backend` → **Build index** (23 files, 45 functions).
-2. **Live Monitor** → log file `sample_logs/shopflow.log` → **Start monitor**.
-3. Watch the 6 incidents appear (about 10–30 s each) and open them on **Incidents**. Each one names the function where the bug lives, for example `dispatch` in `api/middleware.py` for the `NoneType … 'user_id'` error.
-4. Open the **🩹 Auto-fix** tab → **Generate fix** to see the code change as a diff. **Apply to files** writes it into `sample_backend/`; **Revert** puts the buggy demo code back.
+```bash
+# Terminal 1 — backend API
+uvicorn app.main:app --port 8088
+```
 
-For a live stream, use **Test Logs** → **Generate** → **Monitor it**. The generator's errors also match functions in `sample_backend/`.
+```bash
+# Terminal 2 — dashboard
+streamlit run frontend/streamlit_app.py
+```
 
-> **Tip:** Step 1 can only point at real functions if you index the code that *produced* the logs. With an unrelated index, the analysis falls back to reasoning from the log text alone, and the *Suspected functions* tab says so.
+Open **http://localhost:8501** for the dashboard. The API's interactive docs are at http://127.0.0.1:8088/docs. Keep both terminals open while you use it. To stop, press `Ctrl+C` in each.
+
+### 5. Check it works
+
+On **⚙️ Settings**, *Backend API* should be **Online** and *Groq API key* should say **Looks valid**. If you set up JIRA, click **🔌 Test JIRA connection**.
+
+### 6. Run the tests (optional)
+
+```bash
+pip install pytest
+pytest
+```
+
+## Demo walkthrough
+
+The repo ships with a matching demo pair, so you can show the whole system without a real production app:
+
+- [`sample_backend/`](sample_backend/): **ShopFlow**, a small e-commerce backend with **6 deliberate bugs**.
+- [`sample_logs/shopflow.log`](sample_logs/shopflow.log): 24 log lines from ShopFlow, **6 of them errors**, each caused by one of those bugs.
+
+### What to paste where
+
+| Page | Field | Paste this |
+|---|---|---|
+| 📦 **Codebase** → *Folder on the API server* | Absolute folder path | The full path to `sample_backend` in your clone, e.g. `C:/Users/you/debug-pipeline/sample_backend` |
+| 📡 **Live Monitor** → *Log file* | JSON log file | `sample_logs/shopflow.log` |
+| 📡 **Live Monitor** → *Health-check URL* | URL to poll | `http://127.0.0.1:9999/health` (nothing runs there, so it fails on purpose) |
+| 🧪 **Test Logs** | Output file | `test_logs/live.log` (the default) |
+
+> **Tip:** to get the absolute path, right-click the `sample_backend` folder in VS Code → **Copy Path**. Forward or back slashes both work.
+
+### Step by step
+
+1. **Index the code.** **📦 Codebase** → *Folder on the API server* → paste the `sample_backend` path → **Build index from folder**. Expected: *23 files, 45 functions*. Search `dispatch` in the function browser to show what the AI will see.
+2. **Start monitoring.** **📡 Live Monitor** → *Log file* → paste `sample_logs/shopflow.log` → **▶ Start monitor**. The monitor reads the whole file first, so *Errors detected* jumps to **6**. The AI then analyses them one at a time (about 10–30 s each), and *Analysed* and *JIRA tickets* count up.
+3. **Show the overview.** **🏠 Overview**: pipeline status, severity breakdown, top services, latest incidents.
+4. **Open an incident.** **📋 Incidents** → tick a row. Walk through the tabs: *Fixes*, *Debugging steps*, *Explanation*, *Suspected functions* (shows which function Step 1 picked and why) and *Raw log*. Click the JIRA key to open the ticket.
+5. **Auto-fix.** In the same incident, open **🩹 Auto-fix** → **Generate fix** → review the diff → **Apply to files** (the file in `sample_backend/` really changes) → **↩ Revert** (the bug comes back).
+6. **Live stream.** **🧪 Test Logs** → **▶ Generate** → **Monitor it**. New errors are written, detected and analysed live.
+7. **Health checks.** **📡 Live Monitor** → *Health-check URL* → paste `http://127.0.0.1:9999/health`, *Check every* `3`, *Failures before alert* `3` → **Start monitor**. After about 9 s, an incident says the service is down. Click **⏹ Stop** when done.
+
+### The 6 demo bugs
+
+Use this table to check the AI's answers. *Suspected functions* should name the function in the last column.
+
+| Severity in log | Service | Error | Bug lives in |
+|---|---|---|---|
+| ERROR | auth-service | Authentication failed — invalid credentials | `login_user` · `auth/auth_service.py` |
+| ERROR | api-gateway | `NoneType` object has no attribute `user_id` | `dispatch` · `api/middleware.py` |
+| ERROR | payment-service | Card number fails Luhn check | `validate_card` · `payments/validator.py` |
+| ERROR | db-service | Query exceeded 30 s limit | `run_query` · `database/executor.py` |
+| CRITICAL | db-service | Connection pool exhausted | `acquire` · `database/pool.py` |
+| ERROR | cache-service | Failed to unpickle cached object | `deserialize` · `cache/serializer.py` |
+
+### Before you present again
+
+- **Revert every applied fix** (or run `git checkout sample_backend`), otherwise the demo bugs are gone. `git status` should show no changes in `sample_backend/`.
+- **Incidents → Clear events** to start from an empty dashboard. Restarting the API also clears them.
+- Each run creates new JIRA tickets. Close the old ones in JIRA to keep the board tidy.
+
+> **Why the index matters:** Step 1 can only point at real functions if you index the code that *produced* the logs. With an unrelated index, the analysis falls back to reasoning from the log text alone, and the *Suspected functions* tab says so.
 
 ## Configuration
 
@@ -87,6 +156,7 @@ All settings live in `.env` (template: [`.env.example`](.env.example)). Restart 
 | `JIRA_PROJECT_KEY` | for tickets | Ticket prefix, e.g. `KAN` for `KAN-1` (also in the board URL after `/projects/`) |
 | `SMTP_USERNAME`, `SMTP_APP_PASSWORD`, `NOTIFY_EMAIL` | optional | Gmail + [App Password](https://myaccount.google.com/apppasswords); used by `demo_app.py` to email you when a ticket is created |
 | `ALLOW_FIX_APPLY` | optional | `true` by default. Set `false` to stop the dashboard writing patches to disk (patches can still be downloaded) |
+| `FIX_APPLY_ROOT` | optional | Only let **Apply** write inside this folder, e.g. `sample_backend` |
 | `DEBUG_PIPELINE_API` | optional | Dashboard → API address if the API isn't on `http://127.0.0.1:8088` |
 
 Use **Settings → Test JIRA connection** to verify the credentials. Tickets are created as `Bug`, falling back to `Task` if the project has no `Bug` type. If JIRA rejects a field, the client retries with fewer fields instead of failing.
@@ -99,7 +169,7 @@ The repo includes a [`render.yaml`](render.yaml) Blueprint. It runs one free web
 2. Fill in the secrets Render asks for: `GROQ_API_KEY`, plus the four `JIRA_*` values to create tickets.
 3. Click **Apply**. The first build takes a few minutes.
 
-On the free plan, the service sleeps after 15 minutes without traffic, and the next visit takes about a minute to wake it. The disk is reset on every restart, so incidents are cleared and `sample_backend/` is re-indexed automatically. If the URL is public, anyone can use the dashboard, which spends your Groq quota and creates tickets in your JIRA project. **Apply to files** writes into whichever folder is indexed, and any visitor can choose that folder, so set `ALLOW_FIX_APPLY=false` on a public URL. Downloading patches still works.
+On the free plan, the service sleeps after 15 minutes without traffic, and the next visit takes about a minute to wake it. The disk is reset on every restart, so incidents are cleared and `sample_backend/` is re-indexed automatically. If the URL is public, anyone can use the dashboard, which spends your Groq quota and creates tickets in your JIRA project. The Blueprint sets `FIX_APPLY_ROOT=sample_backend`, so **Apply to files** can only change the demo backend, never the app itself. Set `ALLOW_FIX_APPLY=false` to turn Apply off completely; downloading patches still works.
 
 ## Standalone demo (no backend)
 
@@ -186,8 +256,9 @@ sample_backend/                     # ShopFlow: buggy demo backend to index
 sample_logs/shopflow.log            # Demo log matching sample_backend (6 errors)
 sample_logs/app.log                 # Small generic sample log (3 errors)
 docs/                               # README screenshots
+tests/                              # pytest tests for the auto-fix patcher
 ```
 
 ## Tech stack
 
-Python · FastAPI · Groq (`openai/gpt-oss-120b`) · JIRA Cloud REST API v3 · Streamlit · Pydantic
+Python · FastAPI · Groq (`openai/gpt-oss-120b`) · JIRA Cloud REST API v3 · Streamlit · Pydantic · pytest
